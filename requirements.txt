@@ -1,1 +1,5 @@
-streamlit
+streamlit==1.39.0
+pandas==2.2.2
+ortools==9.9.3963
+icalendar==5.0.12
+pytz==2024.1
