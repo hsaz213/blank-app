@@ -516,7 +516,7 @@ def randomize_dialog_de():
     _randomize_body()
 
 def _randomize_body():
-    n = st.slider(t("dlg_rand_how_many"), min_value=4, max_value=400, value=25, step=1)
+    n = st.slider(t("dlg_rand_how_many"), min_value=2, max_value=200, value=25, step=1)
     cgen, ccancel = st.columns(2)
     with cgen:
         if st.button(t("dlg_generate"), type="primary"):
