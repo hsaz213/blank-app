@@ -1,4 +1,5 @@
 import io
+import calendar
 from datetime import datetime, timedelta
 from uuid import uuid4
 import random
@@ -13,6 +14,7 @@ from pytz import timezone
 # Config
 # =========================================================
 EVENT_DURATION_MINUTES = 120  # exam length used for overlap checks & ICS
+MAX_CSV_SIZE_BYTES = 5 * 1024  # 5 kB
 
 # =========================================================
 # i18n
@@ -37,6 +39,7 @@ STRINGS = {
 
         "error_read_csv": "Failed to read CSV: {err}",
         "error_rows_invalid": "Some rows are invalid. See left table (added 'errors' column).",
+        "error_csv_too_large": "File is too large (> {kb} kB). Please upload a smaller CSV.",
 
         "clash_alert": "Clash detected: {n} exam(s) overlap and were excluded from the schedule.",
         "min_gap_banner": "Minimum gap (between starts): {gap}.",
@@ -95,6 +98,7 @@ STRINGS = {
 
         "error_read_csv": "CSV konnte nicht gelesen werden: {err}",
         "error_rows_invalid": "Einige Zeilen sind ungültig. Siehe linke Tabelle (Spalte 'errors' hinzugefügt).",
+        "error_csv_too_large": "Datei ist zu groß (> {kb} kB). Bitte eine kleinere CSV hochladen.",
 
         "clash_alert": "Konflikt erkannt: {n} Prüfung(en) überlappen sich und wurden ausgeschlossen.",
         "min_gap_banner": "Mindestabstand (zwischen Starts): {gap}.",
@@ -133,6 +137,9 @@ STRINGS = {
         "lang_label": "Language / Sprache",
         "lang_en": "English",
         "lang_de": "Deutsch",
+
+        "browse_files": "Datei auswählen",
+        "drag_hint": "Datei hierher ziehen und ablegen",
     },
 }
 
@@ -164,6 +171,22 @@ def format_gap_text(td: timedelta, lang: str = "en") -> str:
         if not parts:
             parts.append("0 minutes")
         return " and ".join(parts)
+
+# --- Date helpers -----------------------------------------------------------
+
+import calendar as _calendar
+
+def add_one_calendar_month(dt: datetime) -> datetime:
+    """Add one calendar month to dt, clamping the day to the end of month if needed."""
+    y, m = dt.year, dt.month
+    new_y = y + (1 if m == 12 else 0)
+    new_m = 1 if m == 12 else m + 1
+    last_day = _calendar.monthrange(new_y, new_m)[1]
+    new_day = min(dt.day, last_day)
+    return dt.replace(year=new_y, month=new_m, day=new_day)
+
+def _rounded_now():
+    return datetime.now().replace(minute=0, second=0, microsecond=0)
 
 # -----------------------------
 # Helpers: data & state
@@ -198,20 +221,23 @@ init_state()
 
 # --- Add-form state helpers (fix time pickers) ------------------------------
 
-def _rounded_now():
-    return datetime.now().replace(minute=0, second=0, microsecond=0)
-
 def init_add_form_defaults():
+    """Default Exam 2 one calendar month after Exam 1 (same time)."""
     if "add_subj" not in st.session_state:
         st.session_state.add_subj = ""
     if "add_d1" not in st.session_state:
         st.session_state.add_d1 = datetime.now().date()
     if "add_t1" not in st.session_state:
         st.session_state.add_t1 = _rounded_now().time()
-    if "add_d2" not in st.session_state:
-        st.session_state.add_d2 = datetime.now().date()
-    if "add_t2" not in st.session_state:
-        st.session_state.add_t2 = (_rounded_now() + timedelta(hours=2)).time()
+    # Compute Exam 2 defaults based on Exam 1 defaults
+    if "add_d2" not in st.session_state or "add_t2" not in st.session_state:
+        base_dt1 = datetime.combine(
+            st.session_state.get("add_d1", datetime.now().date()),
+            st.session_state.get("add_t1", _rounded_now().time()),
+        )
+        dt2 = add_one_calendar_month(base_dt1)
+        st.session_state.add_d2 = dt2.date()
+        st.session_state.add_t2 = dt2.time()
 
 def clear_add_form_defaults():
     for k in ("add_subj", "add_d1", "add_t1", "add_d2", "add_t2"):
@@ -277,9 +303,14 @@ SUBJECT_POOL = [
     "Kommunikation","Wirtschaftsinformatik","Elektrotechnik","Physik","Chemie","Nachhaltigkeit"
 ]
 
+def _rnd_exam_hour():
+    """Whole hour between 09:00 and 15:00 inclusive."""
+    return random.randint(9, 15)
+
 def random_demo_df(n=12, start_date=None, days=40):
     if start_date is None:
         start_date = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+    base_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
     base = SUBJECT_POOL[:]
     if n <= len(base):
         subjects = random.sample(base, k=n)
@@ -289,69 +320,80 @@ def random_demo_df(n=12, start_date=None, days=40):
         subjects.extend(extra)
     rows = []
     for s in subjects:
-        d1 = start_date + timedelta(
-            days=random.randint(0, days),
-            hours=random.choice([0,2,4,6,8,10,12,14,16])
-        )
-        d2 = d1 + timedelta(
-            days=random.randint(3, 21),
-            hours=random.choice([2,4,6,8,10,12])
-        )
+        d1_day = base_date + timedelta(days=random.randint(0, days))
+        d1 = d1_day.replace(hour=_rnd_exam_hour())
+        d2_day = d1 + timedelta(days=random.randint(3, 21))
+        d2 = d2_day.replace(hour=_rnd_exam_hour(), minute=0, second=0, microsecond=0)
+        d1 = d1.replace(minute=0, second=0, microsecond=0)
         rows.append({"subject": s, "exam1": d1, "exam2": d2})
     return pd.DataFrame(rows, columns=LEFT_COLUMNS)
 
 # -----------------------------
-# Optimizer (max-min gap with deterministic tie-break)
+# Optimizer (deterministic + penalize equal starts)
 # -----------------------------
 
 def optimize(left_df: pd.DataFrame):
-    # validate rows
     errs = row_errors(left_df)
     if any(errs):
-        # return errors back
         return None, errs
 
     exams = []
     for _, r in left_df.iterrows():
         exams.append({
             "module": str(r["subject"]),
-            "slots": [pd.to_datetime(r["exam1"]).to_pydatetime(),
-                      pd.to_datetime(r["exam2"]).to_pydatetime()]
+            "slots": [
+                pd.to_datetime(r["exam1"]).to_pydatetime(),
+                pd.to_datetime(r["exam2"]).to_pydatetime()
+            ]
         })
 
     n = len(exams)
     model = cp_model.CpModel()
     x = [model.NewIntVar(0, 1, f"x_{i}") for i in range(n)]
-    ts_mat = [[int(s.timestamp()) for s in ex["slots"]] for ex in exams]
+    ts_mat = [[int(s.timestamp() // 60) for s in ex["slots"]] for ex in exams]
 
     chosen = []
     for i in range(n):
-        tvar = model.NewIntVar(0, int(1e12), f"time_{i}")
-        model.AddElement(x[i], ts_mat[i], tvar)
-        chosen.append(tvar)
+        t = model.NewIntVar(0, int(1e12), f"time_{i}")
+        model.AddElement(x[i], ts_mat[i], t)
+        chosen.append(t)
 
     min_gap = model.NewIntVar(0, int(1e12), "min_gap")
     for i in range(n):
-        for j in range(i+1, n):
+        for j in range(i + 1, n):
             diff = model.NewIntVar(0, int(1e12), f"diff_{i}_{j}")
             model.AddAbsEquality(diff, chosen[i] - chosen[j])
             model.Add(diff >= min_gap)
 
-    model.Maximize(min_gap)
+    eq_vars = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            b = model.NewBoolVar(f"eq_{i}_{j}")
+            model.Add(chosen[i] == chosen[j]).OnlyEnforceIf(b)
+            model.Add(chosen[i] != chosen[j]).OnlyEnforceIf(b.Not())
+            eq_vars.append(b)
+
+    pairs = n * (n - 1) // 2
+    W = pairs + n + 1
+    model.Maximize(min_gap * W - sum(eq_vars) - sum(x))
+
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 60
-    status = solver.Solve(model)
+    solver.parameters.random_seed = 0
+    solver.parameters.num_search_workers = 1
 
+    status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return None, pd.Series(["no solution"]*n)
+        return None, pd.Series(["no solution"] * n)
 
     rows = []
     for i in range(n):
         idx = solver.Value(x[i])
         dt = exams[i]["slots"][idx]
         rows.append({"subject": exams[i]["module"], "optimal_date": dt, "slot": idx + 1})
+
     right_df = pd.DataFrame(rows, columns=RIGHT_COLUMNS)
-    return right_df, pd.Series([""]*n)
+    return right_df, pd.Series([""] * n)
 
 # -----------------------------
 # Feasible subset (remove overlaps)
@@ -446,7 +488,7 @@ def build_ics(right_df: pd.DataFrame, *,
     return cal.to_ical()
 
 # -----------------------------
-# Dialogs (titles must be static at decorate-time → two variants)
+# Dialogs
 # -----------------------------
 
 @st.dialog("Add subject")
@@ -458,6 +500,7 @@ def add_subject_dialog_de():
     _add_subject_body()
 
 def _add_subject_body():
+    # Defaults: Exam 2 one calendar month after Exam 1 (same time)
     def _init_defaults():
         if "add_subj" not in st.session_state:
             st.session_state.add_subj = ""
@@ -465,20 +508,25 @@ def _add_subject_body():
             st.session_state.add_d1 = datetime.now().date()
         if "add_t1" not in st.session_state:
             st.session_state.add_t1 = _rounded_now().time()
-        if "add_d2" not in st.session_state:
-            st.session_state.add_d2 = datetime.now().date()
-        if "add_t2" not in st.session_state:
-            st.session_state.add_t2 = (_rounded_now() + timedelta(hours=2)).time()
+        if "add_d2" not in st.session_state or "add_t2" not in st.session_state:
+            base_dt1 = datetime.combine(
+                st.session_state.get("add_d1", datetime.now().date()),
+                st.session_state.get("add_t1", _rounded_now().time()),
+            )
+            dt2 = add_one_calendar_month(base_dt1)
+            st.session_state.add_d2 = dt2.date()
+            st.session_state.add_t2 = dt2.time()
+
     _init_defaults()
 
     subj = st.text_input(t("dlg_subject"), key="add_subj")
     col_a, col_b = st.columns(2)
     with col_a:
         st.date_input(t("dlg_exam1_date"), key="add_d1")
-        st.time_input(t("dlg_exam1_time"), key="add_t1", step=timedelta(minutes=15))
+        st.time_input(t("dlg_exam1_time"), key="add_t1", step=timedelta(minutes=5))
     with col_b:
         st.date_input(t("dlg_exam2_date"), key="add_d2")
-        st.time_input(t("dlg_exam2_time"), key="add_t2", step=timedelta(minutes=15))
+        st.time_input(t("dlg_exam2_time"), key="add_t2", step=timedelta(minutes=5))
 
     csave, ccancel = st.columns(2)
     with csave:
@@ -516,7 +564,7 @@ def randomize_dialog_de():
     _randomize_body()
 
 def _randomize_body():
-    n = st.slider(t("dlg_rand_how_many"), min_value=2, max_value=200, value=25, step=1)
+    n = st.slider(t("dlg_rand_how_many"), min_value=1, max_value=100, value=25, step=1)
     cgen, ccancel = st.columns(2)
     with cgen:
         if st.button(t("dlg_generate"), type="primary"):
@@ -552,7 +600,7 @@ with head_right:
 
     # Non-editable toggle (no typing), compact, inline with title
     lang_choice = st.radio(
-        label="",                       # no label
+        label="",  # no label
         options=["EN", "DE"],
         horizontal=True,
         index=0 if st.session_state.lang == "en" else 1,
@@ -564,30 +612,39 @@ with head_right:
         st.session_state.lang = new_lang
         st.rerun()
 
+# --- File uploader styled as a simple button --------------------------------
+# We still use st.file_uploader under the hood, but hide the dropzone and
+# show ONLY a full-width button whose label = t("read_csv").
+
+
 left_col, right_col = st.columns([1, 1])
 
 # Top button rows
 with left_col:
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        uploaded = st.file_uploader(t("read_csv"), type=["csv"], label_visibility="collapsed")
+        uploaded = st.file_uploader("", type=["csv"], label_visibility="collapsed")
         if uploaded is not None:
             try:
-                uploaded.seek(0)
-                tmp = pd.read_csv(uploaded, sep=None, engine="python")
-                ok, msg = validate_csv(tmp)
-                if not ok:
-                    st.error(msg)
+                # Enforce size limit before reading
+                if getattr(uploaded, "size", 0) > MAX_CSV_SIZE_BYTES:
+                    st.error(t("error_csv_too_large", kb=MAX_CSV_SIZE_BYTES // 1024))
                 else:
                     uploaded.seek(0)
-                    st.session_state.left_df = df_from_csv(uploaded)
-                    st.toast(t("toast_loaded", n=len(st.session_state.left_df)), icon="✅")
-                    st.session_state.right_df = pd.DataFrame(columns=RIGHT_COLUMNS)
-                    st.session_state.min_gap_td = None
-                    st.session_state.dropped_df = pd.DataFrame()
-                    st.session_state.drop_explanations = pd.DataFrame()
-                    st.session_state.last_export = None
-                    st.session_state.clash_count = 0
+                    tmp = pd.read_csv(uploaded, sep=None, engine="python")
+                    ok, msg = validate_csv(tmp)
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        uploaded.seek(0)
+                        st.session_state.left_df = df_from_csv(uploaded)
+                        st.toast(t("toast_loaded", n=len(st.session_state.left_df)), icon="✅")
+                        st.session_state.right_df = pd.DataFrame(columns=RIGHT_COLUMNS)
+                        st.session_state.min_gap_td = None
+                        st.session_state.dropped_df = pd.DataFrame()
+                        st.session_state.drop_explanations = pd.DataFrame()
+                        st.session_state.last_export = None
+                        st.session_state.clash_count = 0
             except Exception as e:
                 st.error(t("error_read_csv", err=e))
     with c2:
@@ -605,7 +662,6 @@ with left_col:
     st.subheader(t("input_header"))
     st.caption(t("input_caption"))
     left_display = st.session_state.left_df.copy()
-    # Format datetime columns to hide seconds
     if not left_display.empty:
         left_display["exam1"] = pd.to_datetime(left_display["exam1"]).dt.strftime('%Y-%m-%d %H:%M')
         left_display["exam2"] = pd.to_datetime(left_display["exam2"]).dt.strftime('%Y-%m-%d %H:%M')
@@ -653,7 +709,6 @@ with right_col:
 
     st.subheader(t("optimized_header"))
     right_display = st.session_state.right_df.copy()
-    # Format datetime column to hide seconds
     if not right_display.empty:
         right_display["optimal_date"] = pd.to_datetime(right_display["optimal_date"]).dt.strftime('%Y-%m-%d %H:%M')
     right_display = right_display.rename(
